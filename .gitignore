@@ -1,1 +1,25 @@
-build*/
+# Zephyr build directories
+build/
+build_*/
+
+# DFU packages and zip artifacts
+*.zip
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
