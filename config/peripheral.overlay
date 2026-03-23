@@ -1,0 +1,21 @@
+/*
+ * peripheral.overlay — LED aliases (GPIO + PWM)
+ *
+ * Board node labels (from nrf52840dongle_nrf52840_common.dtsi):
+ *   led0_green : P0.06  ACTIVE_LOW  (GPIO only)
+ *   led1_red   : P0.08  ACTIVE_LOW  (PWM0 ch0)
+ *   led1_green : P1.09  ACTIVE_LOW  (PWM0 ch1)
+ *   led1_blue  : P0.12  ACTIVE_LOW  (PWM0 ch2)
+ *
+ * PWM aliases from board: pwm-led0=red, pwm-led1=green, pwm-led2=blue
+ */
+
+/ {
+	aliases {
+		led-active  = &led0_green;   /* green GPIO — connected state */
+		led-idle    = &led1_red;     /* red  GPIO  — fallback        */
+		led-usb     = &led1_blue;    /* blue GPIO  — fallback        */
+		pwm-red     = &red_pwm_led;  /* red  PWM   — breathing       */
+		pwm-blue    = &blue_pwm_led; /* blue PWM   — adv blink       */
+	};
+};
