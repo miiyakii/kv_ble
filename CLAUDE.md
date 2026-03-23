@@ -41,12 +41,72 @@ kv_ble/
 # Build peripheral firmware
 west build -b nrf52840dongle/nrf52840 -- -DKM_APP=peripheral
 
-# Flash (after nrfutil install)
-west flash
-
-# Or build in build_peripheral dir
+# Incremental build (faster)
 cd build_peripheral && cmake --build .
 ```
+
+## Flashing (nRF52840 Dongle via USB DFU)
+
+`west flash` 在此项目不可用（west manifest 解析有 Python 兼容性问题）。
+使用以下手动流程，已验证可用。
+
+### 前提
+
+- nrfutil 8.x（含 nrf5sdk-tools 插件）位于：
+  `~/ncs/toolchains/2ac5840438/nrfutil/home/bin/nrfutil`
+- 插件目录：`~/ncs/toolchains/2ac5840438/nrfutil/home/lib/`
+
+### 步骤
+
+**1. 进入 DFU 模式**
+
+按住 Dongle 侧面按钮后插入 USB，红色 LED 慢闪即为 DFU 模式。
+
+确认设备：
+```bash
+lsusb | grep Nordic
+# 应看到: Nordic Semiconductor ASA Open DFU Bootloader (VID 1915:521f)
+```
+
+确认串口：
+```bash
+ls /dev/ttyACM*
+# DFU Bootloader 通常是 ttyACM1（ttyACM0 是 Central 设备）
+```
+
+**2. 生成 DFU zip 包**
+
+```bash
+NRFUTIL=~/ncs/toolchains/2ac5840438/nrfutil/home/bin/nrfutil
+
+$NRFUTIL nrf5sdk-tools pkg generate \
+  --hw-version 52 \
+  --sd-req 0x00 \
+  --application build_peripheral/zephyr/zephyr.hex \
+  --application-version 1 \
+  /tmp/peripheral_dfu.zip
+```
+
+`--sd-req 0x00` 表示不依赖 SoftDevice（Zephyr BLE 栈无需 SoftDevice）。
+
+**3. 烧录**
+
+```bash
+NRFUTIL_HOME=~/ncs/toolchains/2ac5840438/nrfutil/home \
+sudo -E ~/ncs/toolchains/2ac5840438/nrfutil/home/bin/nrfutil nrf5sdk-tools dfu usb-serial \
+  -pkg /tmp/peripheral_dfu.zip \
+  -p /dev/ttyACM1
+```
+
+成功输出：`Device programmed.`
+
+烧录完成后 Dongle 自动重启运行新固件，从 `lsusb` 消失属正常（固件无 USB 描述符）。
+
+### 注意事项
+
+- 必须用 `sudo -E`（保留 `NRFUTIL_HOME` 环境变量），否则 sudo 找不到 nrf5sdk-tools 插件
+- 串口号用错会报 `No trigger interface found`，换另一个 ttyACM 端口即可
+- `LIBUSB_ERROR_ACCESS` 说明缺少 sudo 权限
 
 ## Current Firmware: BLE HID Peripheral (nRF52840 Dongle)
 

@@ -21,10 +21,10 @@
  *   ID 2 (TEMP_ID)       — temporary identity used during bt_id_reset() swap
  *
  * LED states:
- *   red slow blink (500ms) = no bond, waiting for SW1
- *   blue = advertising
- *   purple blink (200ms)   = connected, waiting for security
- *   green = secured / connected
+ *   red breathing        = initializing / no bond, waiting for SW1
+ *   blue fast blink      = advertising
+ *   purple blink (200ms) = connected, waiting for security
+ *   green solid          = secured / connected
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -80,15 +80,16 @@ static const struct pwm_dt_spec pwm_blue = PWM_DT_SPEC_GET(DT_ALIAS(pwm_blue));
 
 /* ── LED effect engine ───────────────────────────────────────────────── */
 /*
- * A single k_timer drives all LED animations at 20 ms intervals.
- * Each effect keeps its own phase counter.
+ * A k_timer fires every 20 ms and submits led_work to the system workqueue.
+ * All PWM/GPIO calls happen in workqueue context (not ISR), which is safe
+ * for drivers that may sleep or use mutexes internally.
  *
  * Effects:
  *   EFFECT_OFF          — all LEDs off
  *   EFFECT_GREEN_ON     — solid green (GPIO)
- *   EFFECT_RED_BREATHE  — red PWM breathing (sine-like triangle wave)
- *   EFFECT_BLUE_BLINK   — blue PWM slow blink (1 Hz, sharp on/off)
- *   EFFECT_PURPLE_BLINK — red+blue GPIO fast blink 200 ms (security wait)
+ *   EFFECT_RED_BREATHE  — red PWM breathing (triangle wave, ~2.5 s period)
+ *   EFFECT_BLUE_BLINK   — blue PWM fast blink (~4 Hz)
+ *   EFFECT_PURPLE_BLINK — red+blue PWM fast blink 200 ms (security wait)
  */
 typedef enum {
 	EFFECT_OFF,
@@ -98,24 +99,24 @@ typedef enum {
 	EFFECT_PURPLE_BLINK,
 } led_effect_t;
 
-static volatile led_effect_t current_effect = EFFECT_OFF;
+static atomic_t current_effect = ATOMIC_INIT(EFFECT_OFF);
 static struct k_timer led_timer;
-static uint32_t led_tick;   /* increments every 20 ms */
+static struct k_work  led_work;
+static uint32_t led_tick;   /* incremented in workqueue, no concurrent writers */
 
-/* Triangle-wave brightness table for breathing effect */
+/* Triangle-wave brightness for breathing effect */
 static uint8_t breathe_lut(uint32_t tick)
 {
 	/* One full breath = 128 ticks × 20 ms = 2.56 s */
 	uint32_t phase = tick & 127U;
 	/* Triangle: 0→63 up, 64→127 down */
-	uint8_t v = (phase < 64U) ? (uint8_t)(phase * 4U)
-				   : (uint8_t)((127U - phase) * 4U);
-	return v;  /* 0..252 */
+	return (phase < 64U) ? (uint8_t)(phase * 4U)
+			     : (uint8_t)((127U - phase) * 4U);
 }
 
-static void led_timer_cb(struct k_timer *t)
+static void led_work_handler(struct k_work *work)
 {
-	led_effect_t eff = current_effect;
+	led_effect_t eff = (led_effect_t)atomic_get(&current_effect);
 
 	led_tick++;
 
@@ -133,7 +134,6 @@ static void led_timer_cb(struct k_timer *t)
 		break;
 
 	case EFFECT_RED_BREATHE: {
-		/* brightness 0..248, map to pulse width */
 		uint32_t bright = breathe_lut(led_tick);
 		uint32_t pulse  = (PWM_PERIOD * bright) / 255U;
 
@@ -144,9 +144,8 @@ static void led_timer_cb(struct k_timer *t)
 	}
 
 	case EFFECT_BLUE_BLINK: {
-		/* ~4 Hz fast blink: 6 ticks on, 6 ticks off (12-tick cycle at 20ms = 120ms) */
-		uint32_t phase = led_tick % 12U;
-		uint32_t pulse = (phase < 6U) ? PWM_PERIOD : 0U;
+		/* ~4 Hz: 6 ticks on, 6 ticks off (12-tick cycle at 20ms = 240ms) */
+		uint32_t pulse = ((led_tick % 12U) < 6U) ? PWM_PERIOD : 0U;
 
 		pwm_set_dt(&pwm_red,  PWM_PERIOD, 0);
 		pwm_set_dt(&pwm_blue, PWM_PERIOD, pulse);
@@ -156,9 +155,7 @@ static void led_timer_cb(struct k_timer *t)
 
 	case EFFECT_PURPLE_BLINK: {
 		/* 200 ms blink: 10-tick cycle at 20ms */
-		uint32_t phase  = led_tick % 10U;
-		uint32_t on     = (phase < 5U) ? 1U : 0U;
-		uint32_t pulse  = on ? PWM_PERIOD : 0U;
+		uint32_t pulse = ((led_tick % 10U) < 5U) ? PWM_PERIOD : 0U;
 
 		pwm_set_dt(&pwm_red,  PWM_PERIOD, pulse);
 		pwm_set_dt(&pwm_blue, PWM_PERIOD, pulse);
@@ -168,44 +165,69 @@ static void led_timer_cb(struct k_timer *t)
 	}
 }
 
+/* Timer expiry: ISR context — only submits work, no driver calls */
+static void led_timer_cb(struct k_timer *t)
+{
+	k_work_submit(&led_work);
+}
+
 static void led_set_effect(led_effect_t eff)
 {
 	led_tick = 0;
-	current_effect = eff;
+	atomic_set(&current_effect, (atomic_val_t)eff);
 }
 
 /* ── Convenience wrappers used by BLE state machine ─────────────────── */
-static void leds_off(void)           { led_set_effect(EFFECT_OFF);          }
-static void led_set_advertising(void){ led_set_effect(EFFECT_BLUE_BLINK);   }
-static void led_set_connected(void)  { led_set_effect(EFFECT_GREEN_ON);     }
-static void blink_start(void)        { led_set_effect(EFFECT_PURPLE_BLINK); }
-static void blink_stop(void)         { led_set_effect(EFFECT_OFF);          }
-static void slow_blink_start(void)   { led_set_effect(EFFECT_RED_BREATHE);  }
-static void slow_blink_stop(void)    { /* effect replaced by caller */       }
+static void led_set_advertising(void) { led_set_effect(EFFECT_BLUE_BLINK);   }
+static void led_set_connected(void)   { led_set_effect(EFFECT_GREEN_ON);     }
+static void led_set_securing(void)    { led_set_effect(EFFECT_PURPLE_BLINK); }
+static void led_set_idle(void)        { led_set_effect(EFFECT_RED_BREATHE);  }
 
 /* ── HID TX indicator — green flashes 30 ms on each report sent ──────── */
-static struct k_timer hid_tx_timer;
+static struct k_work_delayable hid_tx_work;
 
-static void hid_tx_timer_cb(struct k_timer *t)
+static void hid_tx_work_handler(struct k_work *work)
 {
-	/* Only restore green-on if we're still in connected state */
-	if (current_effect == EFFECT_GREEN_ON) {
+	/* Restore green if still in connected state */
+	if ((led_effect_t)atomic_get(&current_effect) == EFFECT_GREEN_ON) {
 		gpio_pin_set_dt(&led_active, 1);
 	}
 }
 
-static void hid_tx_flash(void)
+/* Call this after sending a HID report to flash green LED briefly */
+void hid_tx_flash(void)
 {
-	if (current_effect != EFFECT_GREEN_ON) {
+	if ((led_effect_t)atomic_get(&current_effect) != EFFECT_GREEN_ON) {
 		return;
 	}
 	gpio_pin_set_dt(&led_active, 0);
-	k_timer_start(&hid_tx_timer, K_MSEC(30), K_NO_WAIT);
+	k_work_reschedule(&hid_tx_work, K_MSEC(30));
+}
+
+/* ── Button interrupt ────────────────────────────────────────────────── */
+static struct gpio_callback btn_cb_data;
+static struct k_work_delayable btn_work;
+static int64_t btn_press_start_ms;
+
+static void btn_work_handler(struct k_work *work);  /* forward declaration */
+
+static void btn_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	bool pressed = (gpio_pin_get_dt(&btn) == 1);
+
+	if (pressed) {
+		btn_press_start_ms = k_uptime_get();
+		/* Schedule check after 3 s */
+		k_work_reschedule(&btn_work, K_MSEC(3000));
+	} else {
+		/* Released before 3 s — cancel long-press */
+		k_work_cancel_delayable(&btn_work);
+	}
 }
 
 /* ── BLE state ───────────────────────────────────────────────────────── */
-static struct bt_conn *current_conn;
-static bool pairing_mode;   /* set by SW1 long-press or stale-LTK, cleared on pairing_complete */
+static struct bt_conn *current_conn;  /* accessed only from system workqueue */
+static bool pairing_mode;             /* likewise */
 
 /* ── Advertising data ────────────────────────────────────────────────── */
 static const struct bt_data ad[] = {
@@ -247,7 +269,6 @@ static void adv_work_handler(struct k_work *work)
 	};
 	int err;
 
-	/* Rebuild filter accept list from bonds on PEER_ID */
 	bt_le_filter_accept_list_clear();
 
 	if (!pairing_mode) {
@@ -256,15 +277,12 @@ static void adv_work_handler(struct k_work *work)
 		bt_foreach_bond(PEER_ID, accept_list_add, &bond_cnt);
 
 		if (bond_cnt == 0) {
-			/* No bonds and not in pairing mode — stay idle */
 			LOG_INF("No bonds — long-press SW1 to pair");
-			slow_blink_start();
+			led_set_idle();
 			return;
 		}
 
-		/* Bonded peers are in the Resolving List (IRK added during bonding),
-		 * so the controller can resolve Windows RPA → identity address and
-		 * match the FAL entry. Both FILTER_CONN and FILTER_SCAN_REQ are safe. */
+		/* Bonded peers in Resolving List → FAL works with Windows RPA */
 		adv_param.options |= BT_LE_ADV_OPT_FILTER_SCAN_REQ;
 		adv_param.options |= BT_LE_ADV_OPT_FILTER_CONN;
 		LOG_INF("Advertising (bonded-only, %d peer(s))", bond_cnt);
@@ -272,7 +290,6 @@ static void adv_work_handler(struct k_work *work)
 		LOG_INF("Advertising open (pairing mode)");
 	}
 
-	slow_blink_stop();
 	err = bt_le_adv_start(&adv_param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 	if (err && err != -EALREADY) {
 		LOG_ERR("bt_le_adv_start failed: %d", err);
@@ -287,14 +304,11 @@ static void advertising_start(void)
 	k_work_submit(&adv_work);
 }
 
-/* ── Identity reset work — called on stale LTK ───────────────────────── */
+/* ── Identity reset work — called on stale LTK or SW1 long-press ─────── */
 static struct k_work identity_reset_work;
 
 static void identity_reset_handler(struct k_work *work)
 {
-	/* Reset PEER_ID: generates a new BDA so Windows sees a brand-new device
-	 * and initiates fresh pairing without requiring the user to delete the
-	 * old bond on the PC. The old stale bond on Windows becomes orphaned. */
 	int err = bt_id_reset(PEER_ID, NULL, NULL);
 
 	if (err < 0) {
@@ -307,13 +321,18 @@ static void identity_reset_handler(struct k_work *work)
 	advertising_start();
 }
 
-/* ── SW1 long press: clear bonds, enter pairing mode ────────────────── */
-static void do_unpair(void)
+/* ── SW1 long-press handler (runs in workqueue after 3 s) ────────────── */
+static void btn_work_handler(struct k_work *work)
 {
+	/* Verify button is still held at 3 s mark */
+	if (gpio_pin_get_dt(&btn) != 1) {
+		return;
+	}
+
 	LOG_INF("Long press — resetting identity, entering pairing mode");
 
 	if (current_conn) {
-		/* identity_reset_work will be submitted from disconnected() */
+		/* identity_reset_work submitted from disconnected() */
 		pairing_mode = true;
 		bt_conn_disconnect(current_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 	} else {
@@ -400,8 +419,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 	current_conn = bt_conn_ref(conn);
 	bt_hids_connected(&hids_obj, conn);
-	slow_blink_stop();
-	blink_start();   /* purple = waiting for security */
+	led_set_securing();   /* purple = waiting for security */
 	LOG_INF("Connected");
 }
 
@@ -411,10 +429,10 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	bt_hids_disconnected(&hids_obj, conn);
 	bt_conn_unref(current_conn);
 	current_conn = NULL;
-	blink_stop();
 
-	/* If pairing_mode was set (stale LTK or SW1 long-press), reset identity
-	 * so Windows sees a fresh device and re-pairs automatically. */
+	/* Cancel any pending HID TX flash */
+	k_work_cancel_delayable(&hid_tx_work);
+
 	if (pairing_mode) {
 		k_work_submit(&identity_reset_work);
 	} else {
@@ -426,29 +444,21 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 			      enum bt_security_err err)
 {
 	if (err == BT_SECURITY_ERR_PIN_OR_KEY_MISSING) {
-		/* Stale LTK: controller lost IRK/LTK (e.g. firmware reset wiped
-		 * settings). Reset the identity so Windows sees a brand-new device
-		 * address and initiates fresh pairing automatically — no manual
-		 * bond deletion needed on the PC side.
-		 * Do NOT use FORCE_PAIR — causes infinite loop on Windows. */
+		/* Stale LTK: reset identity so Windows sees a new device address
+		 * and re-pairs automatically — no manual bond deletion needed. */
 		LOG_WRN("Stale LTK — resetting identity for automatic re-pair");
 		pairing_mode = true;
-		blink_stop();
-		led_set_advertising();
 		bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
 		/* identity_reset_work submitted from disconnected() */
 		return;
 	}
 	if (err) {
 		LOG_WRN("Security failed (%d) — disconnecting", err);
-		blink_stop();
-		led_set_advertising();
 		bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
 		return;
 	}
 	if (level >= BT_SECURITY_L2) {
 		LOG_INF("Secured (level %d)", level);
-		blink_stop();
 		led_set_connected();   /* green */
 	}
 }
@@ -468,8 +478,6 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
 static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 {
 	LOG_WRN("Pairing failed (%d)", reason);
-	blink_stop();
-	led_set_advertising();
 	bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
 }
 
@@ -488,22 +496,29 @@ int main(void)
 	/* LEDs */
 	gpio_pin_configure_dt(&led_active, GPIO_OUTPUT_INACTIVE);
 
-	/* Button */
+	/* Button — interrupt driven */
 	gpio_pin_configure_dt(&btn, GPIO_INPUT);
+	gpio_pin_interrupt_configure_dt(&btn, GPIO_INT_EDGE_BOTH);
+	gpio_init_callback(&btn_cb_data, btn_isr, BIT(btn.pin));
+	gpio_add_callback(btn.port, &btn_cb_data);
 
-	/* LED effect timer — fires every 20 ms */
+	/* LED effect: timer submits work, driver calls happen in workqueue */
+	k_work_init(&led_work, led_work_handler);
 	k_timer_init(&led_timer, led_timer_cb, NULL);
 	k_timer_start(&led_timer, K_MSEC(20), K_MSEC(20));
 
-	/* HID TX flash timer — single-shot, restores green after 30 ms */
-	k_timer_init(&hid_tx_timer, hid_tx_timer_cb, NULL);
+	/* HID TX flash — delayable work */
+	k_work_init_delayable(&hid_tx_work, hid_tx_work_handler);
 
-	/* Work items */
+	/* Button long-press — delayable work */
+	k_work_init_delayable(&btn_work, btn_work_handler);
+
+	/* Other work items */
 	k_work_init(&adv_work,            adv_work_handler);
 	k_work_init(&identity_reset_work, identity_reset_handler);
 
 	/* BLE init — red breathing during initialization */
-	led_set_effect(EFFECT_RED_BREATHE);
+	led_set_idle();
 	err = bt_enable(NULL);
 	if (err) {
 		LOG_ERR("bt_enable: %d", err);
@@ -512,19 +527,17 @@ int main(void)
 
 	settings_load();
 
-	/* Ensure PEER_ID (ID 1) and TEMP_ID (ID 2) exist.
-	 * bt_id_get() returns count via pointer; bt_id_create() returns the new id. */
+	/* Ensure PEER_ID (ID 1) and TEMP_ID (ID 2) exist */
 	size_t id_count = 0;
 
 	bt_id_get(NULL, &id_count);
-	while ((int)id_count <= TEMP_ID) {
+	for (size_t i = id_count; i <= TEMP_ID; i++) {
 		err = bt_id_create(NULL, NULL);
 		if (err < 0) {
 			LOG_ERR("bt_id_create failed: %d", err);
 			break;
 		}
 		LOG_INF("Created BT identity ID %d", err);
-		id_count++;
 	}
 
 	/* Clean up any stale bonds on TEMP_ID from a previous interrupted reset */
@@ -541,57 +554,6 @@ int main(void)
 
 	advertising_start();
 
-	/* ── Main loop ── */
-	int64_t last_hid        = 0;
-	int64_t btn_press_start = 0;
-	bool    kb_pressed      = false;
-	bool    btn_held        = false;
-
-	while (1) {
-		int64_t now = k_uptime_get();
-
-		/* SW1 long-press detection (3s) */
-		bool btn_down = (gpio_pin_get_dt(&btn) == 1);
-
-		if (btn_down) {
-			if (!btn_held) {
-				btn_held        = true;
-				btn_press_start = now;
-			} else if ((now - btn_press_start) >= 3000) {
-				btn_held = false;
-				do_unpair();
-			}
-		} else {
-			btn_held = false;
-		}
-
-		/* Fake HID every 500ms when connected */
-		if (current_conn && (now - last_hid >= 500)) {
-			last_hid = now;
-
-			payload_kb_t kb = {0};
-
-			if (!kb_pressed) {
-				kb.keys[0] = 0x04;   /* 'a' */
-			}
-			kb_pressed = !kb_pressed;
-			bt_hids_inp_rep_send(&hids_obj, current_conn,
-					     REP_IDX_KB,
-					     (uint8_t *)&kb, sizeof(kb), NULL);
-
-			payload_mouse_t mouse = {0};
-
-			mouse.x = 5;
-			bt_hids_inp_rep_send(&hids_obj, current_conn,
-					     REP_IDX_MOUSE,
-					     (uint8_t *)&mouse, sizeof(mouse),
-					     NULL);
-
-			hid_tx_flash();
-		}
-
-		k_sleep(K_MSEC(10));
-	}
-
+	/* Main thread has nothing to do — all logic is event-driven */
 	return 0;
 }
