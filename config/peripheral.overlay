@@ -1,5 +1,5 @@
 /*
- * peripheral.overlay — LED aliases (GPIO + PWM)
+ * peripheral.overlay — LED aliases (GPIO + PWM) + USB CDC ACM
  *
  * Board node labels (from nrf52840dongle_nrf52840_common.dtsi):
  *   led0_green : P0.06  ACTIVE_LOW  (GPIO only)
@@ -17,5 +17,33 @@
 		led-usb     = &led1_blue;    /* blue GPIO  — fallback        */
 		pwm-red     = &red_pwm_led;  /* red  PWM   — breathing       */
 		pwm-blue    = &blue_pwm_led; /* blue PWM   — adv blink       */
+	};
+};
+
+/* Board defines PWM LEDs as ACTIVE_LOW (PWM_POLARITY_INVERTED).
+ * Override to POLARITY_NORMAL: pulse=0 → off, pulse=period → full brightness. */
+&red_pwm_led {
+	pwms = <&pwm0 0 PWM_MSEC(2) PWM_POLARITY_INVERTED>;
+};
+
+&blue_pwm_led {
+	pwms = <&pwm0 2 PWM_MSEC(2) PWM_POLARITY_INVERTED>;
+};
+
+/* Disable board's default CDC ACM backend so we own the node */
+&board_cdc_acm_uart {
+	status = "disabled";
+};
+
+/* Register our CDC ACM UART instance */
+&zephyr_udc0 {
+	cdc_acm_uart1: cdc_acm_uart1 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+
+/ {
+	aliases {
+		km-uart = &cdc_acm_uart1;
 	};
 };

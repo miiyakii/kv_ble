@@ -3,4 +3,6 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(kv_ble)
 
-target_sources(app PRIVATE src/main.c)
+if(KM_APP STREQUAL "peripheral")
+  target_sources(app PRIVATE src/peripheral/main.c)
+endif()

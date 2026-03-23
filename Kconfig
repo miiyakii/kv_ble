@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "KV BLE KM Switch"
+
+source "$ZEPHYR_BASE/samples/subsys/usb/common/Kconfig.sample_usbd"
+
+config BT_DIRECTED_ADVERTISING
+	bool "Enable directed advertising to bonded peers"
+	default y
+	depends on BT_PRIVACY
+
+source "Kconfig.zephyr"
