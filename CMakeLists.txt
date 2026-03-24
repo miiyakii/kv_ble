@@ -5,4 +5,10 @@ project(kv_ble)
 
 if(KM_APP STREQUAL "peripheral")
   target_sources(app PRIVATE src/peripheral/main.c)
+  include(${ZEPHYR_BASE}/samples/subsys/usb/common/common.cmake)
+endif()
+
+if(KM_APP STREQUAL "central")
+  target_sources(app PRIVATE src/central/main.c)
+  include(${ZEPHYR_BASE}/samples/subsys/usb/common/common.cmake)
 endif()

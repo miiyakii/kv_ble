@@ -34,8 +34,13 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/pwm.h>
+#include <zephyr/drivers/uart.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/sys/ring_buffer.h>
+#include <zephyr/sys/crc.h>
+#include <zephyr/usb/usbd.h>
+#include <sample_usbd.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -408,6 +413,186 @@ static int hids_init(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * USB CDC-ACM + km_proto frame receiver
+ *
+ * Frame format: [0xAA][TYPE:1B][LEN:1B][PAYLOAD:LEN B][CRC8-CCITT:1B]
+ *   TYPE 0x01 → keyboard report  (payload_kb_t,    8 B)
+ *   TYPE 0x02 → mouse report     (payload_mouse_t, 5 B)
+ *
+ * UART ISR puts raw bytes into a ring buffer and submits uart_rx_work.
+ * The workqueue handler runs the parser state machine and calls
+ * frame_dispatch() on valid frames — all driver calls stay out of ISR.
+ * ═══════════════════════════════════════════════════════════════════════ */
+#define KM_FRAME_MAGIC   0xAAU
+#define KM_TYPE_KB       0x01U
+#define KM_TYPE_MOUSE    0x02U
+#define KM_PAYLOAD_MAX   16U
+#define KM_CRC_INIT      0xFFU
+
+static const struct device *km_uart = DEVICE_DT_GET(DT_ALIAS(km_uart));
+static struct usbd_context  *usbd_ctx;
+
+RING_BUF_DECLARE(uart_rx_rb, 256);
+static struct k_work uart_rx_work;
+
+/* ── frame_dispatch: send HID report over BLE ───────────────────────── */
+static void frame_dispatch(uint8_t type, const uint8_t *p, uint8_t len)
+{
+	if (!current_conn) {
+		return;
+	}
+	if (type == KM_TYPE_KB && len == sizeof(payload_kb_t)) {
+		bt_hids_inp_rep_send(&hids_obj, current_conn,
+				     REP_IDX_KB, p, len, NULL);
+		hid_tx_flash();
+	} else if (type == KM_TYPE_MOUSE && len == sizeof(payload_mouse_t)) {
+		bt_hids_inp_rep_send(&hids_obj, current_conn,
+				     REP_IDX_MOUSE, p, len, NULL);
+		hid_tx_flash();
+	} else {
+		LOG_WRN("frame_dispatch: unknown type=0x%02x len=%u", type, len);
+	}
+}
+
+/* ── Frame parser state machine ─────────────────────────────────────── */
+typedef enum {
+	ST_MAGIC,
+	ST_TYPE,
+	ST_LEN,
+	ST_PAYLOAD,
+	ST_CRC,
+} frame_state_t;
+
+static void uart_rx_work_handler(struct k_work *work)
+{
+	static frame_state_t state   = ST_MAGIC;
+	static uint8_t       f_type;
+	static uint8_t       f_len;
+	static uint8_t       f_buf[KM_PAYLOAD_MAX];
+	static uint8_t       f_idx;
+
+	uint8_t byte;
+
+	while (ring_buf_get(&uart_rx_rb, &byte, 1) == 1) {
+		switch (state) {
+		case ST_MAGIC:
+			if (byte == KM_FRAME_MAGIC) {
+				state = ST_TYPE;
+			}
+			break;
+
+		case ST_TYPE:
+			f_type = byte;
+			state  = ST_LEN;
+			break;
+
+		case ST_LEN:
+			if (byte == 0 || byte > KM_PAYLOAD_MAX) {
+				LOG_WRN("Bad frame len: %u — resync", byte);
+				state = ST_MAGIC;
+				break;
+			}
+			f_len  = byte;
+			f_idx  = 0;
+			state  = ST_PAYLOAD;
+			break;
+
+		case ST_PAYLOAD:
+			f_buf[f_idx++] = byte;
+			if (f_idx == f_len) {
+				state = ST_CRC;
+			}
+			break;
+
+		case ST_CRC: {
+			uint8_t crc = crc8_ccitt(KM_CRC_INIT, f_buf, f_len);
+
+			if (crc == byte) {
+				frame_dispatch(f_type, f_buf, f_len);
+			} else {
+				LOG_WRN("CRC mismatch: got 0x%02x expect 0x%02x",
+					byte, crc);
+			}
+			state = ST_MAGIC;
+			break;
+		}
+		}
+	}
+}
+
+/* ── UART ISR: copy bytes to ring buffer, submit work ───────────────── */
+static void uart_isr(const struct device *dev, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	while (uart_irq_update(dev) && uart_irq_is_pending(dev)) {
+		if (!uart_irq_rx_ready(dev)) {
+			break;
+		}
+
+		uint8_t buf[64];
+		int     n = uart_fifo_read(dev, buf, sizeof(buf));
+
+		if (n > 0) {
+			uint32_t written = ring_buf_put(&uart_rx_rb, buf, n);
+
+			if (written < (uint32_t)n) {
+				LOG_WRN("uart_rx_rb full, dropped %d B", n - (int)written);
+			}
+			k_work_submit(&uart_rx_work);
+		}
+	}
+}
+
+/* ── USB USBD msg callback ───────────────────────────────────────────── */
+static void usbd_msg_cb(struct usbd_context *const ctx, const struct usbd_msg *msg)
+{
+	LOG_DBG("USBD: %s", usbd_msg_type_string(msg->type));
+
+	if (usbd_can_detect_vbus(ctx)) {
+		if (msg->type == USBD_MSG_VBUS_READY) {
+			if (usbd_enable(ctx)) {
+				LOG_ERR("usbd_enable failed");
+			}
+		} else if (msg->type == USBD_MSG_VBUS_REMOVED) {
+			usbd_disable(ctx);
+		}
+	}
+}
+
+/* ── USB + UART init (call before bt_enable) ─────────────────────────── */
+static int usb_uart_init(void)
+{
+	int err;
+
+	if (!device_is_ready(km_uart)) {
+		LOG_ERR("CDC ACM UART not ready");
+		return -ENODEV;
+	}
+
+	usbd_ctx = sample_usbd_init_device(usbd_msg_cb);
+	if (!usbd_ctx) {
+		LOG_ERR("sample_usbd_init_device failed");
+		return -ENODEV;
+	}
+
+	if (!usbd_can_detect_vbus(usbd_ctx)) {
+		err = usbd_enable(usbd_ctx);
+		if (err) {
+			LOG_ERR("usbd_enable failed: %d", err);
+			return err;
+		}
+	}
+
+	k_work_init(&uart_rx_work, uart_rx_work_handler);
+	uart_irq_callback_user_data_set(km_uart, uart_isr, NULL);
+	uart_irq_rx_enable(km_uart);
+
+	LOG_INF("USB CDC-ACM ready");
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * BLE connection callbacks
  * ═══════════════════════════════════════════════════════════════════════ */
 static void connected(struct bt_conn *conn, uint8_t err)
@@ -516,6 +701,13 @@ int main(void)
 	/* Other work items */
 	k_work_init(&adv_work,            adv_work_handler);
 	k_work_init(&identity_reset_work, identity_reset_handler);
+
+	/* USB CDC-ACM + UART — init before BLE */
+	err = usb_uart_init();
+	if (err) {
+		LOG_ERR("usb_uart_init: %d", err);
+		return err;
+	}
 
 	/* BLE init — red breathing during initialization */
 	led_set_idle();

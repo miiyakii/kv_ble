@@ -30,20 +30,13 @@
 	pwms = <&pwm0 2 PWM_MSEC(2) PWM_POLARITY_INVERTED>;
 };
 
-/* Disable board's default CDC ACM backend so we own the node */
+/* Enable the board's built-in CDC ACM UART and use it as the km serial port */
 &board_cdc_acm_uart {
-	status = "disabled";
-};
-
-/* Register our CDC ACM UART instance */
-&zephyr_udc0 {
-	cdc_acm_uart1: cdc_acm_uart1 {
-		compatible = "zephyr,cdc-acm-uart";
-	};
+	status = "okay";
 };
 
 / {
 	aliases {
-		km-uart = &cdc_acm_uart1;
+		km-uart = &board_cdc_acm_uart;
 	};
 };
