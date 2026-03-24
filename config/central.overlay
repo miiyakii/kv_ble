@@ -1,0 +1,40 @@
+/*
+ * central.overlay — same hardware as peripheral (nRF52840 Dongle)
+ *
+ * LED aliases (GPIO + PWM) + USB CDC ACM km-uart alias.
+ * Board node labels (from nrf52840dongle_nrf52840_common.dtsi):
+ *   led0_green : P0.06  ACTIVE_LOW  (GPIO only)
+ *   led1_red   : P0.08  ACTIVE_LOW  (PWM0 ch0)
+ *   led1_green : P1.09  ACTIVE_LOW  (PWM0 ch1)
+ *   led1_blue  : P0.12  ACTIVE_LOW  (PWM0 ch2)
+ */
+
+/ {
+	aliases {
+		led-active  = &led0_green;   /* green GPIO — forwarding active */
+		led-idle    = &led1_red;     /* red  GPIO  — fallback          */
+		led-usb     = &led1_blue;    /* blue GPIO  — fallback          */
+		pwm-red     = &red_pwm_led;  /* red  PWM   — scanning breathe  */
+		pwm-blue    = &blue_pwm_led; /* blue PWM   — connecting blink  */
+	};
+};
+
+/* Override to POLARITY_INVERTED: pulse=0 → off, pulse=period → full brightness */
+&red_pwm_led {
+	pwms = <&pwm0 0 PWM_MSEC(2) PWM_POLARITY_INVERTED>;
+};
+
+&blue_pwm_led {
+	pwms = <&pwm0 2 PWM_MSEC(2) PWM_POLARITY_INVERTED>;
+};
+
+/* Enable CDC ACM UART for km serial port */
+&board_cdc_acm_uart {
+	status = "okay";
+};
+
+/ {
+	aliases {
+		km-uart = &board_cdc_acm_uart;
+	};
+};

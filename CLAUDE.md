@@ -41,9 +41,20 @@ kv_ble/
 # Build peripheral firmware
 west build -b nrf52840dongle/nrf52840 -- -DKM_APP=peripheral
 
+# Build central firmware (--no-sysbuild required for KM_APP to reach CMakeLists.txt)
+west build -b nrf52840dongle/nrf52840 -d build_central --no-sysbuild -- \
+  -DKM_APP=central \
+  -DCONF_FILE="$(pwd)/config/prj_central.conf" \
+  -DDTC_OVERLAY_FILE="$(pwd)/config/central.overlay"
+
 # Incremental build (faster)
 cd build_peripheral && cmake --build .
+cd build_central && cmake --build .
 ```
+
+**Note**: Central build requires `--no-sysbuild`. Without it, `-DKM_APP=central` is consumed
+by the sysbuild layer and not forwarded to the inner CMakeLists.txt, causing "No SOURCES given".
+Peripheral build works without this flag because it uses a flat (non-sysbuild) structure.
 
 ## Flashing (nRF52840 Dongle via USB DFU)
 
