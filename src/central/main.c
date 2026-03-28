@@ -1,8 +1,8 @@
 /*
  * src/central/main.c — Dongle 1 firmware (KM-Central)
  *
- * Role: BLE Central — connects to keyboard/mouse (HOGP client), forwards
- *       HID reports as km_proto frames over USB CDC-ACM to Linux km_relay.
+ * Role: BLE Central — connects to mouse (HOGP client), forwards
+ *       mouse HID reports as km_proto frames over USB CDC-ACM to Linux km_relay.
  *       Also receives TYPE 0x10 (switch notification) from Linux for LED feedback.
  *
  * Flow:
@@ -44,7 +44,6 @@ LOG_MODULE_REGISTER(central, LOG_LEVEL_INF);
 
 /* ── km_proto frame constants ────────────────────────────────────────── */
 #define KM_FRAME_MAGIC   0xAAU
-#define KM_TYPE_KB       0x01U
 #define KM_TYPE_MOUSE    0x02U
 #define KM_TYPE_SWITCH   0x10U   /* Linux→Central: switch notification */
 #define KM_PAYLOAD_MAX   16U
@@ -191,16 +190,9 @@ static uint8_t hogp_notify_cb(struct bt_hogp *hogp_obj,
 
 	uint8_t id   = bt_hogp_rep_id(rep);
 	uint8_t size = bt_hogp_rep_size(rep);
-	uint8_t type = 0;
 
-	if (id == 1) {
-		type = KM_TYPE_KB;
-	} else if (id == 2) {
-		type = KM_TYPE_MOUSE;
-	}
-
-	if (type != 0) {
-		uart_send_frame(type, data, size);
+	if (id == 2) {
+		uart_send_frame(KM_TYPE_MOUSE, data, size);
 	} else {
 		LOG_DBG("hogp: unhandled report id=%u size=%u", id, size);
 	}

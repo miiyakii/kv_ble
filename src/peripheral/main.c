@@ -1,19 +1,16 @@
 /*
- * src/peripheral/main.c — Dongle 2/3 firmware
+ * src/peripheral/main.c — KVM Dongle firmware (keyboard-only)
  *
  * Advertising strategy:
  *   - ID 1 (peer identity), has bonds → undirected adv + FAL (FILTER_CONN + FILTER_SCAN_REQ)
  *     Windows RPA is resolved by the controller via the Resolving List (IRK added during
  *     bonding), so FAL + FILTER_CONN works correctly for bonded Windows peers.
- *   - ID 1, no bonds, pairing_mode=false → idle, red slow blink, wait for SW1
+ *   - ID 1, no bonds, pairing_mode=false → idle, red slow breathe, wait for SW1
  *   - ID 1, no bonds, pairing_mode=true  → open undirected adv (SW1 long-press)
  *
  * Stale LTK handling (Windows reconnect after firmware reset):
- *   When PIN_OR_KEY_MISSING fires, the controller's Resolving List no longer has the
- *   peer's IRK (lost on reset), so FAL rejected the connection at the link layer.
- *   Fix: reset ID 1 via bt_id_reset() — this changes the local BDA so Windows sees a
- *   brand-new device and initiates fresh pairing without the user needing to delete
- *   the old bond on the PC side. Same approach as nRF Desktop ble_bond.c.
+ *   When PIN_OR_KEY_MISSING fires, reset ID 1 via bt_id_reset() so Windows sees a
+ *   brand-new device and initiates fresh pairing without manual bond deletion.
  *
  * Identity map (CONFIG_BT_ID_MAX=3):
  *   ID 0 (BT_ID_DEFAULT) — unused (reserved, nRF Desktop convention)
@@ -25,6 +22,12 @@
  *   blue fast blink      = advertising
  *   purple blink (200ms) = connected, waiting for security
  *   green solid          = secured / connected
+ *   green 30ms flash     = HID report sent
+ *
+ * Serial frame format: [0xAA][TYPE:1B][LEN:1B][PAYLOAD:LEN B][CRC8-CCITT:1B]
+ *   TYPE 0x01 → keyboard report  (8 B: mods, reserved, 6 keycodes)
+ *   TYPE 0x02 → mouse report     (5 B: buttons, x, y, wheel, pan)
+ *   TYPE 0x03 → all-keys-release (8 B payload ignored, sends zero report)
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -63,12 +66,16 @@ typedef struct {
 	uint8_t keys[6];
 } payload_kb_t;
 
+/* 7-byte raw passthrough — Logitech POP Mouse format:
+ *   [0] buttons (5 keys + 3-bit padding)
+ *   [1] reserved
+ *   [2][3] X  12-bit signed little-endian (packed across bytes)
+ *   [3][4] Y  12-bit signed little-endian (packed across bytes)
+ *   [5] wheel signed
+ *   [6] pan   signed
+ */
 typedef struct {
-	uint8_t buttons;
-	int8_t  x;
-	int8_t  y;
-	int8_t  wheel;
-	int8_t  pan;
+	uint8_t raw[7];
 } payload_mouse_t;
 
 /* ── GPIO ────────────────────────────────────────────────────────────── */
@@ -212,7 +219,6 @@ void hid_tx_flash(void)
 /* ── Button interrupt ────────────────────────────────────────────────── */
 static struct gpio_callback btn_cb_data;
 static struct k_work_delayable btn_work;
-static int64_t btn_press_start_ms;
 
 static void btn_work_handler(struct k_work *work);  /* forward declaration */
 
@@ -221,18 +227,15 @@ static void btn_isr(const struct device *dev, struct gpio_callback *cb, uint32_t
 	bool pressed = (gpio_pin_get_dt(&btn) == 1);
 
 	if (pressed) {
-		btn_press_start_ms = k_uptime_get();
-		/* Schedule check after 3 s */
 		k_work_reschedule(&btn_work, K_MSEC(3000));
 	} else {
-		/* Released before 3 s — cancel long-press */
 		k_work_cancel_delayable(&btn_work);
 	}
 }
 
 /* ── BLE state ───────────────────────────────────────────────────────── */
-static struct bt_conn *current_conn;  /* accessed only from system workqueue */
-static bool pairing_mode;             /* likewise */
+static struct bt_conn *current_conn;
+static bool pairing_mode;
 
 /* ── Advertising data ────────────────────────────────────────────────── */
 static const struct bt_data ad[] = {
@@ -351,30 +354,50 @@ static void btn_work_handler(struct k_work *work)
 static const uint8_t hid_report_desc[] = {
 	/* Keyboard — Report ID 1 */
 	0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, 0x01,
+	/* Modifier keys */
 	0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7,
 	0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+	/* Reserved byte */
 	0x95, 0x01, 0x75, 0x08, 0x81, 0x01,
+	/* Keycodes (6-key rollover) */
 	0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
 	0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
+	/* LED output report (NumLock, CapsLock, ScrollLock, Compose, Kana) */
 	0x05, 0x08, 0x19, 0x01, 0x29, 0x05,
 	0x95, 0x05, 0x75, 0x01, 0x91, 0x02,
 	0x95, 0x01, 0x75, 0x03, 0x91, 0x01,
 	0xC0,
-	/* Mouse — Report ID 2 */
+	/* Mouse — Report ID 2 (Logitech POP Mouse, 7-byte, 12-bit XY) */
 	0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02,
 	0x09, 0x01, 0xA1, 0x00,
+	/* Buttons 1-5 */
 	0x05, 0x09, 0x19, 0x01, 0x29, 0x05,
 	0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x05, 0x81, 0x02,
+	/* Padding 3 bits */
 	0x75, 0x03, 0x95, 0x01, 0x81, 0x01,
-	0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
-	0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
+	/* Reserved 8 bits */
+	0x75, 0x08, 0x95, 0x01, 0x81, 0x01,
+	/* X 12-bit signed (-2048..2047) */
+	0x05, 0x01, 0x09, 0x30,
+	0x16, 0x00, 0xF8, 0x26, 0xFF, 0x07,
+	0x75, 0x0C, 0x95, 0x01, 0x81, 0x06,
+	/* Y 12-bit signed (-2048..2047) */
+	0x09, 0x31,
+	0x16, 0x00, 0xF8, 0x26, 0xFF, 0x07,
+	0x75, 0x0C, 0x95, 0x01, 0x81, 0x06,
+	/* Wheel 8-bit signed */
+	0x09, 0x38,
+	0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+	/* Pan 8-bit signed */
+	0x05, 0x0C, 0x0A, 0x38, 0x02,
+	0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
 	0xC0, 0xC0,
 };
 
 #define REP_IDX_KB     0
 #define REP_IDX_MOUSE  1
 
-BT_HIDS_DEF(hids_obj, sizeof(payload_kb_t), sizeof(payload_mouse_t), 1);
+BT_HIDS_DEF(hids_obj, sizeof(payload_kb_t), 7, 1);
 
 static void hids_led_handler(struct bt_hids_rep *rep,
 			     struct bt_conn *conn, bool is_write)
@@ -415,9 +438,10 @@ static int hids_init(void)
 /* ═══════════════════════════════════════════════════════════════════════
  * USB CDC-ACM + km_proto frame receiver
  *
- * Frame format: [0xAA][TYPE:1B][LEN:1B][PAYLOAD:LEN B][CRC8-CCITT:1B]
- *   TYPE 0x01 → keyboard report  (payload_kb_t,    8 B)
- *   TYPE 0x02 → mouse report     (payload_mouse_t, 5 B)
+ * Frame: [0xAA][TYPE:1B][LEN:1B][PAYLOAD:LEN B][CRC8-CCITT:1B]
+ *   TYPE 0x01 → keyboard report  (8 B)
+ *   TYPE 0x02 → mouse report     (5 B: buttons, x, y, wheel, pan)
+ *   TYPE 0x03 → all-keys-release (payload ignored, sends zero report)
  *
  * UART ISR puts raw bytes into a ring buffer and submits uart_rx_work.
  * The workqueue handler runs the parser state machine and calls
@@ -426,6 +450,7 @@ static int hids_init(void)
 #define KM_FRAME_MAGIC   0xAAU
 #define KM_TYPE_KB       0x01U
 #define KM_TYPE_MOUSE    0x02U
+#define KM_TYPE_RELEASE  0x03U
 #define KM_PAYLOAD_MAX   16U
 #define KM_CRC_INIT      0xFFU
 
@@ -438,9 +463,19 @@ static struct k_work uart_rx_work;
 /* ── frame_dispatch: send HID report over BLE ───────────────────────── */
 static void frame_dispatch(uint8_t type, const uint8_t *p, uint8_t len)
 {
+	static const uint8_t zero_report[sizeof(payload_kb_t)] = {0};
+
 	if (!current_conn) {
 		return;
 	}
+
+	if (type == KM_TYPE_RELEASE) {
+		bt_hids_inp_rep_send(&hids_obj, current_conn,
+				     REP_IDX_KB, zero_report,
+				     sizeof(zero_report), NULL);
+		return;
+	}
+
 	if (type == KM_TYPE_KB && len == sizeof(payload_kb_t)) {
 		bt_hids_inp_rep_send(&hids_obj, current_conn,
 				     REP_IDX_KB, p, len, NULL);

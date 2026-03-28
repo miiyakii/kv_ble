@@ -1,0 +1,11 @@
+app:
+  address: 0x1000
+  size: 0xdb000
+
+settings_storage:
+  address: 0xdc000
+  size: 0x4000
+
+nordic_bootloader:
+  address: 0xe0000
+  size: 0x20000
